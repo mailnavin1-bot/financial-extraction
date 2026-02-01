@@ -1,7 +1,7 @@
 """
 Vast.ai Instance Manager
 Handles launching, monitoring, and shutting down GPU instances via direct REST API
-Implements 'Fast Start' with SECURE CONFIG INJECTION (No keys in GitHub needed)
+Implements 'Fast Start' logic using public base images and runtime git cloning
 """
 
 import os
@@ -56,35 +56,29 @@ class VastManager:
     def _get_onstart_script(self, mode: str) -> str:
         """
         Generates the bash script to run on instance boot.
-        1. Clones the code from GitHub (Safe)
-        2. Injects the keys from YOUR LOCAL computer (Secure)
+        1. Clones the code from GitHub
+        2. Injects the keys from YOUR LOCAL computer
+        3. Installs SERVER-SPECIFIC requirements
         """
         settings = load_settings()
         repo_url = settings.get('git_repo_url')
         git_token = settings.get('git_token', '')
         
-        # STOPPER: If user hasn't set up Git, we can't proceed
         if not repo_url or "YOUR_USERNAME" in repo_url:
             raise ValueError(
                 "\n\n!!! CONFIGURATION ERROR !!!\n"
                 "You must set 'git_repo_url' in config/settings.json.\n"
-                "1. Create a repo at github.com\n"
-                "2. Upload ONLY 'scripts' and 'vast' folders (NO CONFIG)\n"
-                "3. Put the URL in config/settings.json\n"
             )
 
-        # Inject token into URL if provided (for private repos)
         if git_token and "https://" in repo_url:
             clean_url = repo_url.replace("https://", "")
             auth_url = f"https://{git_token}@{clean_url}"
         else:
             auth_url = repo_url
             
-        # SECURITY MAGIC: Serialize local settings to inject into remote machine
-        # This prevents us from needing to put keys in GitHub
-        json_content = json.dumps(settings).replace("'", "'\\''") # Escape single quotes
+        json_content = json.dumps(settings).replace("'", "'\\''")
 
-        # The startup script
+        # UPDATED SCRIPT LOGIC
         script = f"""#!/bin/bash
 set -e
 echo "--- FAST START INIT ---"
@@ -93,7 +87,7 @@ echo "--- FAST START INIT ---"
 apt-get update -y
 apt-get install -y git libgl1-mesa-glx libglib2.0-0
 
-# 2. Clone Repository (CODE ONLY)
+# 2. Clone Repository
 echo "Cloning code..."
 rm -rf /workspace/app
 if git clone {auth_url} /workspace/app; then
@@ -103,20 +97,25 @@ else
     exit 1
 fi
 
-# 3. Inject Config (KEYS)
-# We recreate the settings.json file on the remote machine using your local keys
+# 3. Inject Config
 echo "Injecting secure configuration..."
 mkdir -p /workspace/app/config
 echo '{json_content}' > /workspace/app/config/settings.json
 
-# 4. Install Python Deps
+# 4. Install Python Deps (SMART CHECK)
 echo "Installing dependencies..."
 cd /workspace/app
-if [ -f "requirements.txt" ]; then
+
+# CHECK FOR SERVER-SPECIFIC REQUIREMENTS FIRST
+if [ -f "requirements-server.txt" ]; then
+    echo "Found requirements-server.txt - Installing Server Deps Only..."
+    pip install --no-cache-dir -r requirements-server.txt
+elif [ -f "requirements.txt" ]; then
+    echo "Using standard requirements.txt..."
     pip install --no-cache-dir -r requirements.txt
 else
-    echo "No requirements.txt found, installing defaults..."
-    pip install --no-cache-dir pdfplumber PyMuPDF pandas requests
+    echo "No requirements found, installing defaults..."
+    pip install --no-cache-dir fastapi uvicorn python-multipart transformers accelerate qwen_vl_utils tiktoken einops scipy matplotlib
 fi
 
 # 5. Start Application
@@ -124,7 +123,6 @@ echo "Starting application in mode: {mode}..."
 export EXTRACTION_MODE={mode}
 export PYTHONPATH=$PYTHONPATH:/workspace/app
 
-# Run the entrypoint
 if [ -f "entrypoint.sh" ]; then
     bash entrypoint.sh
 else
@@ -145,7 +143,7 @@ fi
             "num_gpus": {"eq": gpu_count},
             "gpu_ram": {"gte": min_gpu_ram * 1024}, 
             "disk_space": {"gte": 20},
-            "inet_down": {"gte": 200},       # REQUIRE FAST INTERNET
+            "inet_down": {"gte": 200},
             "reliability2": {"gte": 0.85}
         }
         
@@ -178,7 +176,6 @@ fi
         
         url = f"{self.API_BASE}/asks/{offer_id}/"
         
-        # Generate the dynamic startup script
         try:
             onstart_cmd = self._get_onstart_script(mode)
         except ValueError as e:
